@@ -35,10 +35,16 @@ static void tof_callback(int ch, char* data, int bytes, void* context) {
     const tof2_data_t* tof = reinterpret_cast<const tof2_data_t*>(data);
 
     static int frame_count = 0;
-    std::printf("frame %d  ts=%llu  dims=%dx%d\n",
+    static unsigned long long previous_time_ns = 0;
+    unsigned long long current_time = (unsigned long long)tof->timestamp_ns;
+    unsigned long long dt_ns = current_time - previous_time_ns;
+    double hz = 1.0 / ((double)dt_ns * 1e-9);
+    std::printf("frame %d hz=%f ts=%llu  dims=%dx%d\n",
                 frame_count++,
-                (unsigned long long)tof->timestamp_ns,
+                hz,
+                current_time,
                 tof->width, tof->height);
+    previous_time_ns = current_time;
     std::fflush(stdout);
 }
 
@@ -52,7 +58,7 @@ int main() {
     const int rc = pipe_client_open(
         0,                                // channel id (your choice, 0-based)
         "tof",                            // pipe name (matches /dev/mpa/tof)
-        "",                               // client name string
+        "tof",                               // client name string
         CLIENT_FLAG_EN_SIMPLE_HELPER,     // spawn background helper thread
         sizeof(tof2_data_t)               // read buffer size
     );
