@@ -153,6 +153,13 @@ def planar_to_range_grid(planar: np.ndarray, far_clip: float = POLICY_MAX_DIST) 
     return _min_pool_to_policy(euclid)
 
 
+def raw_planar_z_to_perception(planar_z: np.ndarray) -> np.ndarray:
+    """Native TOF planar-Z grid (meters) -> DiffAero 9x16 policy perception."""
+    planar = orient_raw_tof(np.asarray(planar_z, dtype=np.float32))
+    range_m = planar_to_range_grid(planar, far_clip=POLICY_MAX_DIST)
+    return encode_policy_perception(range_m, POLICY_MAX_DIST)
+
+
 def depth_u8_to_perception(depth_u8, cfg=None):
     """mono8 depth image -> (perception 9x16, range_9x16 Euclidean)."""
     cfg = cfg or policy_depth_config()

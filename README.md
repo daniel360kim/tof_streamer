@@ -1,6 +1,81 @@
 # ToF Streamer
 
-Reads ToF sensor data from MPA on the Starling 2 Max and (eventually) re-publishes it over MPA.
+Reads ToF sensor data from MPA on the Starling 2 Max and streams it to the ground PC.
+
+**Recommended for AirStack / DiffAero:** use the **UDP path** (`tof_udp_stream.cpp` →
+`ground/tof_udp_bridge.py`). The drone streams **raw planar-Z** over UDP (chunked;
+no ROS on the link). The ground bridge downsamples/encodes to the 9×16 DiffAero
+grid and publishes on domain 1 — so Jazzy never joins the VOXL's Foxy DDS domain
+(which crashes `voxl_mpa_to_ros2`).
+
+The legacy ROS 2 path (sections 2–4) still works for drone-local debugging but
+must not be subscribed from Jazzy on domain 0.
+
+## Quick start — UDP (recommended)
+
+### Finding `GROUND_IP`
+
+The drone sends UDP to your **ground PC's Wi-Fi IP on the same network as the
+VOXL** (not localhost, not a Docker bridge). The AirStack robot container uses
+host networking, so use the **host** address.
+
+On the **ground PC**:
+
+```bash
+export VOXL_IP=192.168.123.167   # your drone IP
+ip -4 addr show                    # wlp* / wlan* → inet 192.168.x.x
+# or auto-detect the source IP for traffic to the drone:
+export GROUND_IP=$(ip -4 route get "$VOXL_IP" | awk '{print $7; exit}')
+echo "GROUND_IP=$GROUND_IP"
+```
+
+Use `192.168.x.x` on the drone subnet — **not** `127.0.0.1`, `172.17.0.1`, or
+`172.31.0.1`. From the drone: `ping -c 1 $GROUND_IP`.
+
+### On the drone (one tmux session, no ROS)
+
+```bash
+export VOXL_IP=192.168.123.167   # your drone IP
+export GROUND_IP=192.168.123.134 # from steps above
+
+scp tof_udp_stream.cpp root@$VOXL_IP:/home/root/
+ssh root@$VOXL_IP
+```
+
+On the drone:
+
+```bash
+# Confirm ToF server is up
+systemctl status voxl-tof-server
+voxl-inspect-pipe tof
+
+cd /home/root
+g++ -std=c++14 -O2 tof_udp_stream.cpp \
+    -o tof_udp_stream /usr/lib64/libmodal_pipe.so -lpthread -lrt -lm
+
+./tof_udp_stream $GROUND_IP 5600
+```
+
+### On the ground (Jazzy, domain 1)
+
+Inside the AirStack robot container or `conda activate ros2`:
+
+```bash
+cd ~/tof_streamer
+ROS_DOMAIN_ID=1 python3 ground/tof_udp_bridge.py --port 5600 \
+  --topic /drone_1/perception/tof
+```
+
+Verify:
+
+```bash
+ros2 topic hz /drone_1/perception/tof    # ~10–30 Hz
+ros2 topic echo /drone_1/perception/tof --once   # 144 floats, 9×16
+```
+
+No `domain_bridge`, no Foxy on the ground, no `ROS_DOMAIN_ID=0` probing.
+
+---
 
 ## 1. Test that `tof_stream.cpp` still runs on the drone
 
