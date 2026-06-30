@@ -12,6 +12,28 @@ FOV_X_DEG = 86.0
 FOV_Y_DEG = FOV_X_DEG * OUT_H / OUT_W  # 48.375 deg
 MAX_RANGE = 6.0  # sensor far clip for invalid pixels
 POLICY_MAX_DIST = 5.0  # DiffAero perception encoding clip [m]
+POLICY_FOV_DEG = 86.0  # DiffAero training crop FOV
+# M0178 / pmd-tof-liow2 (ModalAI datasheet: 106 deg vertical x 86 deg horizontal)
+SENSOR_HFOV_DEG = 86.0
+SENSOR_VFOV_DEG = 106.0
+
+
+class CropConfig:
+    """Vertical placement of the 86 deg training FOV window on the native grid.
+
+    Image rows increase downward (top = ceiling on a forward-facing ToF).
+    v_anchor='bottom' discards the top of the frame (ceiling) first.
+    v_shift_px > 0 moves the window down (more ceiling discarded).
+    """
+
+    __slots__ = ('v_anchor', 'v_shift_px')
+
+    def __init__(self, v_anchor: str = 'center', v_shift_px: int = 0):
+        anchor = str(v_anchor).lower()
+        if anchor not in ('center', 'bottom', 'top'):
+            raise ValueError(f'v_anchor must be center|bottom|top, got {v_anchor!r}')
+        self.v_anchor = anchor
+        self.v_shift_px = int(v_shift_px)
 
 
 def _replace_nonfinite(arr, value):
@@ -145,7 +167,7 @@ def encode_policy_perception(
 
 
 def planar_to_range_grid(planar: np.ndarray, far_clip: float = POLICY_MAX_DIST) -> np.ndarray:
-    """Resize planar depth to render grid, convert to Euclidean, min-pool to 9x16."""
+    """Legacy: resize full frame to 64x36 render grid, euclid, 4x4 min-pool."""
     planar = _resize_nearest(planar, RENDER_H, RENDER_W)
     planar = _replace_nonfinite(planar, far_clip)
     planar = np.where(planar <= 1e-3, far_clip, planar).astype(np.float32)
@@ -153,11 +175,130 @@ def planar_to_range_grid(planar: np.ndarray, far_clip: float = POLICY_MAX_DIST) 
     return _min_pool_to_policy(euclid)
 
 
-def raw_planar_z_to_perception(planar_z: np.ndarray) -> np.ndarray:
+def _intrinsics_oriented(h: int, w: int, landscape_rotated: bool) -> tuple[float, float, float, float]:
+    """Pinhole intrinsics for oriented Starling ToF (matches tof_udp_stream.cpp)."""
+    cx, cy = 0.5 * w, 0.5 * h
+    if landscape_rotated:
+        fx = 0.5 * w / math.tan(0.5 * math.radians(SENSOR_VFOV_DEG))
+        fy = 0.5 * h / math.tan(0.5 * math.radians(SENSOR_HFOV_DEG))
+    else:
+        fx = 0.5 * w / math.tan(0.5 * math.radians(SENSOR_HFOV_DEG))
+        fy = 0.5 * h / math.tan(0.5 * math.radians(SENSOR_VFOV_DEG))
+    return fx, fy, cx, cy
+
+
+def _compute_crop(fx: float, fy: float, cx: float, cy: float, h: int, w: int,
+                  fov_deg: float, crop: CropConfig | None = None) -> tuple[int, int, int, int]:
+    """86 deg angular crop; vertical anchor tunable (center / bottom / top)."""
+    crop = crop or CropConfig()
+    half = math.radians(fov_deg / 2)
+    half_w_px = fx * math.tan(half)
+    half_h_px = fy * math.tan(half)
+    col0 = max(0, int(math.floor(cx - half_w_px)))
+    col1 = min(w, int(math.ceil(cx + half_w_px)))
+
+    crop_h = max(1, int(math.ceil(2.0 * half_h_px)))
+    crop_h = min(crop_h, h)
+    if crop.v_anchor == 'center':
+        row0 = max(0, int(math.floor(cy - half_h_px)))
+        row1 = min(h, int(math.ceil(cy + half_h_px)))
+    elif crop.v_anchor == 'bottom':
+        row1 = h
+        row0 = max(0, row1 - crop_h)
+    else:  # top
+        row0 = 0
+        row1 = min(h, crop_h)
+
+    if crop.v_shift_px:
+        row0 = max(0, min(h - 1, row0 + crop.v_shift_px))
+        row1 = max(row0 + 1, min(h, row1 + crop.v_shift_px))
+    return row0, row1, col0, col1
+
+
+def _compute_pool_edges(crop: tuple[int, int, int, int], out_h: int, out_w: int):
+    row0, row1, col0, col1 = crop
+    crop_h = row1 - row0
+    crop_w = col1 - col0
+    row_edges = np.linspace(0, crop_h, out_h + 1).astype(int)
+    col_edges = np.linspace(0, crop_w, out_w + 1).astype(int)
+    return row_edges, col_edges
+
+
+def _euclid_scale_crop(h: int, w: int, fx: float, fy: float, cx: float, cy: float,
+                       crop: tuple[int, int, int, int]) -> np.ndarray:
+    u = np.arange(w, dtype=np.float32)
+    v = np.arange(h, dtype=np.float32)
+    uu, vv = np.meshgrid(u, v)
+    xn = (uu - cx) / fx
+    yn = (vv - cy) / fy
+    scale = np.sqrt(1.0 + xn * xn + yn * yn).astype(np.float32)
+    row0, row1, col0, col1 = crop
+    return scale[row0:row1, col0:col1]
+
+
+def _min_pool_edges(euclid: np.ndarray, row_edges: np.ndarray, col_edges: np.ndarray,
+                    out_h: int, out_w: int) -> np.ndarray:
+    out = np.empty((out_h, out_w), dtype=np.float32)
+    for i in range(out_h):
+        for j in range(out_w):
+            cell = euclid[row_edges[i]:row_edges[i + 1], col_edges[j]:col_edges[j + 1]]
+            out[i, j] = float(cell.min())
+    return out
+
+
+def planar_to_range_grid_perception(planar: np.ndarray, landscape_rotated: bool,
+                                    far_clip: float = POLICY_MAX_DIST,
+                                    crop: CropConfig | None = None) -> np.ndarray:
+    """PerceptionBuilder path: crop to training FOV -> euclid -> linspace min-pool."""
+    h, w = planar.shape[:2]
+    planar = _replace_nonfinite(planar, far_clip)
+    planar = np.where(planar <= 1e-3, far_clip, planar).astype(np.float32)
+    fx, fy, cx, cy = _intrinsics_oriented(h, w, landscape_rotated)
+    crop_box = _compute_crop(fx, fy, cx, cy, h, w, POLICY_FOV_DEG, crop)
+    row0, row1, col0, col1 = crop_box
+    planar_crop = planar[row0:row1, col0:col1]
+    euclid_scale = _euclid_scale_crop(h, w, fx, fy, cx, cy, crop_box)
+    euclid = planar_crop * euclid_scale
+    row_edges, col_edges = _compute_pool_edges(crop_box, OUT_H, OUT_W)
+    return _min_pool_edges(euclid, row_edges, col_edges, OUT_H, OUT_W)
+
+
+def raw_planar_z_to_perception_debug(
+    planar_z: np.ndarray,
+    flip_lr: bool = False,
+    flip_ud: bool = True,
+    crop: CropConfig | None = None,
+) -> tuple[np.ndarray, tuple[int, int, int, int], np.ndarray]:
+    """Returns (9x16 perception, (row0,row1,col0,col1), oriented planar meters)."""
+    planar = np.asarray(planar_z, dtype=np.float32)
+    landscape_rotated = planar.shape[1] > planar.shape[0]
+    planar = orient_raw_tof(planar)
+    h, w = planar.shape[:2]
+    fx, fy, cx, cy = _intrinsics_oriented(h, w, landscape_rotated)
+    crop_box = _compute_crop(fx, fy, cx, cy, h, w, POLICY_FOV_DEG, crop)
+    range_m = planar_to_range_grid_perception(
+        planar, landscape_rotated, far_clip=POLICY_MAX_DIST, crop=crop)
+    encoded = encode_policy_perception(range_m, POLICY_MAX_DIST)
+    encoded = _maybe_flip_grid(encoded, flip_lr, flip_ud)
+    return encoded, crop_box, planar
+
+
+def _maybe_flip_grid(pooled: np.ndarray, flip_lr: bool, flip_ud: bool) -> np.ndarray:
+    if flip_lr:
+        pooled = pooled[:, ::-1].copy()
+    if flip_ud:
+        pooled = pooled[::-1, :].copy()
+    return pooled
+
+
+def raw_planar_z_to_perception(planar_z: np.ndarray,
+                               flip_lr: bool = False,
+                               flip_ud: bool = True,
+                               crop: CropConfig | None = None) -> np.ndarray:
     """Native TOF planar-Z grid (meters) -> DiffAero 9x16 policy perception."""
-    planar = orient_raw_tof(np.asarray(planar_z, dtype=np.float32))
-    range_m = planar_to_range_grid(planar, far_clip=POLICY_MAX_DIST)
-    return encode_policy_perception(range_m, POLICY_MAX_DIST)
+    perception, _, _ = raw_planar_z_to_perception_debug(
+        planar_z, flip_lr=flip_lr, flip_ud=flip_ud, crop=crop)
+    return perception
 
 
 def depth_u8_to_perception(depth_u8, cfg=None):

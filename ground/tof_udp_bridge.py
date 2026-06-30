@@ -1,15 +1,17 @@
 #!/usr/bin/env python3
-"""Receive raw ToF over UDP, preprocess on ground, publish to ROS 2 (Jazzy).
+"""Receive ToF over UDP and publish the DiffAero 9x16 grid to ROS 2 (Jazzy).
 
 Run on the ground PC inside the AirStack robot container or a Jazzy env:
 
     ROS_DOMAIN_ID=1 python3 ground/tof_udp_bridge.py --port 5600 \\
         --topic /drone_1/perception/tof
 
-The drone sends chunked raw planar-Z (TOF3). This node reassembles frames,
-runs depth_preprocess on the ground, and publishes the 9x16 DiffAero grid.
+The drone (tof_udp_stream.cpp) preprocesses on-board and sends pre-encoded
+9x16 perception grids as TOF2 packets (~592 B/frame). This node decodes and
+republishes them on the processed topic.
 
-Legacy TOF2 (pre-encoded 9x16) packets are still accepted for older builds.
+Legacy TOF3 (chunked raw planar-Z) is still accepted for older builds or
+`--stream-raw` debug mode; pass --raw-topic and --preprocess-tof3 as needed.
 
 No Foxy / domain 0 on the ground — safe alongside the VOXL bench drone.
 """
@@ -27,13 +29,13 @@ from std_msgs.msg import Float32MultiArray, MultiArrayDimension
 
 # Shared preprocessing with the legacy ROS drone node.
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent / 'drone'))
-from depth_preprocess import raw_planar_z_to_perception  # noqa: E402
+from depth_preprocess import CropConfig, raw_planar_z_to_perception  # noqa: E402
 
 UDP_MAGIC_RAW = 0x544F4633  # 'TOF3'
 RAW_HEADER_FMT = '<IIIHHQHH'
 RAW_HEADER_SIZE = struct.calcsize(RAW_HEADER_FMT)
 
-UDP_MAGIC_ENC = 0x544F4632  # 'TOF2' (legacy: drone-side preprocessing)
+UDP_MAGIC_ENC = 0x544F4632  # 'TOF2' (pre-encoded 9x16 from tof_udp_stream.cpp)
 ENC_HEADER_FMT = '<IIQ'
 ENC_HEADER_SIZE = struct.calcsize(ENC_HEADER_FMT)
 
@@ -103,8 +105,12 @@ class FrameAssembler:
 
 
 class TofUdpBridge(Node):
-    def __init__(self, bind_host: str, port: int, topic: str, raw_topic: str | None):
+    def __init__(self, bind_host: str, port: int, topic: str, raw_topic: str | None,
+                 preprocess_tof3: bool, ignore_tof2: bool, crop: CropConfig):
         super().__init__('tof_udp_bridge')
+        self._preprocess_tof3 = preprocess_tof3
+        self._ignore_tof2 = ignore_tof2
+        self._crop = crop
         self._pub = self.create_publisher(Float32MultiArray, topic, 10)
         self._raw_pub = (
             self.create_publisher(Float32MultiArray, raw_topic, 10)
@@ -120,9 +126,10 @@ class TofUdpBridge(Node):
         self._rate_window_start = None
         self._rate_window_frames = 0
         raw_desc = f' + raw {raw_topic}' if raw_topic else ''
+        tof2_desc = 'ignore TOF2' if ignore_tof2 else 'TOF2 + TOF3'
         self.get_logger().info(
-            f'Listening UDP {bind_host}:{port} -> {topic}{raw_desc} '
-            f'(raw TOF3 chunked + legacy TOF2 9x16)'
+            f'Listening UDP {bind_host}:{port} -> {topic}{raw_desc} ({tof2_desc}) '
+            f'crop={crop.v_anchor} shift={crop.v_shift_px}'
         )
 
     def _log_publish_rate(self, label: str):
@@ -170,7 +177,7 @@ class TofUdpBridge(Node):
         h, w = planar_z.shape
         self._raw_pub.publish(self._float_array(planar_z, [('height', h), ('width', w)]))
 
-    def _handle_legacy_encoded(self, data: bytes, addr: str) -> bool:
+    def _handle_encoded(self, data: bytes, addr: str) -> bool:
         if len(data) != ENC_PACKET_SIZE:
             return False
 
@@ -179,7 +186,7 @@ class TofUdpBridge(Node):
             return False
 
         grid = np.frombuffer(data, dtype=np.float32, offset=ENC_HEADER_SIZE).reshape(GRID_H, GRID_W)
-        self._publish_grid(grid, seq, addr[0], 'legacy TOF2')
+        self._publish_grid(grid, seq, addr[0], 'TOF2 9x16')
         return True
 
     def _poll(self):
@@ -191,7 +198,7 @@ class TofUdpBridge(Node):
             except OSError:
                 return
 
-            if self._handle_legacy_encoded(data, addr):
+            if not self._ignore_tof2 and self._handle_encoded(data, addr):
                 continue
 
             assembled = self._assembler.ingest(data)
@@ -207,12 +214,12 @@ class TofUdpBridge(Node):
             planar_z, timestamp_ns = assembled
             try:
                 self._publish_raw(planar_z)
-                perception = raw_planar_z_to_perception(planar_z)
+                if self._preprocess_tof3:
+                    perception = raw_planar_z_to_perception(planar_z, crop=self._crop)
+                    self._publish_grid(perception, timestamp_ns, addr[0], 'raw TOF3')
             except Exception as exc:
                 self.get_logger().warning(f'Preprocess failed: {exc}')
                 continue
-
-            self._publish_grid(perception, timestamp_ns, addr[0], 'raw TOF3')
 
 
 def main():
@@ -226,14 +233,39 @@ def main():
     )
     parser.add_argument(
         '--raw-topic',
-        default='/drone_1/perception/tof_raw',
-        help='ROS 2 raw planar-Z topic for visualization (empty to disable)',
+        default='',
+        help='ROS 2 raw planar-Z topic (TOF3 only; empty to disable)',
+    )
+    parser.add_argument(
+        '--preprocess-tof3',
+        action='store_true',
+        help='Also compute 9x16 grid from TOF3 (legacy TOF3-only drones)',
+    )
+    parser.add_argument(
+        '--ignore-tof2',
+        action='store_true',
+        help='Ignore onboard TOF2 packets (use with tof_crop_tune.py)',
+    )
+    parser.add_argument(
+        '--crop-v-anchor',
+        default='center',
+        choices=['center', 'bottom', 'top'],
+        help='Vertical crop anchor when --preprocess-tof3',
+    )
+    parser.add_argument(
+        '--crop-v-shift',
+        type=int,
+        default=0,
+        help='Extra vertical crop shift in pixels (+ = down, discard ceiling)',
     )
     args = parser.parse_args()
     raw_topic = args.raw_topic or None
+    crop = CropConfig(v_anchor=args.crop_v_anchor, v_shift_px=args.crop_v_shift)
 
     rclpy.init()
-    node = TofUdpBridge(args.bind, args.port, args.topic, raw_topic)
+    node = TofUdpBridge(
+        args.bind, args.port, args.topic, raw_topic, args.preprocess_tof3,
+        args.ignore_tof2, crop)
     try:
         rclpy.spin(node)
     except KeyboardInterrupt:

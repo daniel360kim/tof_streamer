@@ -3,10 +3,11 @@
 Reads ToF sensor data from MPA on the Starling 2 Max and streams it to the ground PC.
 
 **Recommended for AirStack / DiffAero:** use the **UDP path** (`tof_udp_stream.cpp` →
-`ground/tof_udp_bridge.py`). The drone streams **raw planar-Z** over UDP (chunked;
-no ROS on the link). The ground bridge downsamples/encodes to the 9×16 DiffAero
-grid and publishes on domain 1 — so Jazzy never joins the VOXL's Foxy DDS domain
-(which crashes `voxl_mpa_to_ros2`).
+`ground/tof_udp_bridge.py`). The drone runs DiffAero-aligned preprocessing
+on-board (orient → **86° FOV crop** with M0178 intrinsics → euclid → linspace
+min-pool to 9×16 → encode) and streams the pre-encoded **9×16 TOF2** grid over
+UDP (~592 B/frame). The ground bridge decodes and republishes on domain 1 — Jazzy
+never joins the VOXL's Foxy DDS domain (which crashes `voxl_mpa_to_ros2`).
 
 The legacy ROS 2 path (sections 2–4) still works for drone-local debugging but
 must not be subscribed from Jazzy on domain 0.
@@ -46,14 +47,18 @@ On the drone:
 
 ```bash
 # Confirm ToF server is up
-systemctl status voxl-tof-server
-voxl-inspect-pipe tof
+systemctl status voxl-camera-server
+voxl-inspect-cam tof_depth -n   # SDK 1.5: use inspect-cam, not voxl-inspect-pipe
 
 cd /home/root
 g++ -std=c++14 -O2 tof_udp_stream.cpp \
     -o tof_udp_stream /usr/lib64/libmodal_pipe.so -lpthread -lrt -lm
 
-./tof_udp_stream $GROUND_IP 5600
+./tof_udp_stream $GROUND_IP 5600 --crop-v-anchor=bottom --crop-v-shift=-100
+# Starling 2 Max default (bench-tuned; see "Tuning vertical crop" below).
+# Default: +flip-v on 9x16 grid (pitch). --flip-h mirrors yaw — off by default.
+# Pass --no-flip-v if vertical tilt looks inverted.
+# Pass --stream-raw for optional TOF3 debug streaming.
 ```
 
 ### On the ground (Jazzy, domain 1)
@@ -74,6 +79,46 @@ ros2 topic echo /drone_1/perception/tof --once   # 144 floats, 9×16
 ```
 
 No `domain_bridge`, no Foxy on the ground, no `ROS_DOMAIN_ID=0` probing.
+
+### Tuning vertical crop (ceiling in frame)
+
+Default crop is **center** (86° window centered on the optical axis). If the **ceiling**
+dominates the top of the raw ToF view, use a **bottom** anchor to keep the lower
+86° of vertical FOV (forward / ground) and discard the top.
+
+**Recommended: tune on the ground first** (no drone recompile per try):
+
+```bash
+# VOXL — raw TOF3 only
+./tof_udp_stream $GROUND_IP 5600 --raw-only
+
+# Ground — raw topic only, ignore onboard TOF2
+python3 ground/tof_udp_bridge.py --port 5600 \
+  --raw-topic /drone_1/perception/tof_raw --ignore-tof2
+
+# Ground — live crop preview + publishes /drone_1/perception/tof
+python3 ground/tof_crop_tune.py \
+  --crop-v-anchor bottom --crop-v-shift 0
+```
+
+Open RViz on **`/svg/drone_1/tof_crop_debug`**: left = raw with **green crop box**,
+right = upscaled 9×16. Restart `tof_crop_tune.py` with different flags:
+
+| Flag | Effect |
+|------|--------|
+| `--crop-v-anchor bottom` | Keep bottom of frame (drop ceiling first) |
+| `--crop-v-anchor top` | Keep top (rarely useful) |
+| `--crop-v-shift -100` | AirStack / DiffAero default (Starling 2 Max) |
+| `--crop-v-shift 20` | Shift crop down 20 px (discard more ceiling) |
+| `--crop-v-shift -N` | Shift crop up N px (less ceiling discarded) |
+
+When satisfied, deploy on the VOXL (AirStack / DiffAero default for Starling 2 Max):
+
+```bash
+./tof_udp_stream $GROUND_IP 5600 --crop-v-anchor=bottom --crop-v-shift=-100
+```
+
+Or use the same crop flags on `tof_udp_bridge.py --preprocess-tof3` for ground-side preprocessing.
 
 ---
 
